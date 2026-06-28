@@ -6,7 +6,7 @@
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>OrionTalk v1.4.0</title>
+<title>OrionTalk v1.5.0</title>
 <style>
 :root {
   --bg-primary: #1a1a2e;
@@ -566,7 +566,7 @@ body.dragging * { cursor: col-resize !important; }
   <div class="sidebar" id="sidebar">
     <div class="resize-handle" id="resizeHandle"></div>
     <div class="sidebar-header">
-      <span class="logo">&#127752;</span> OrionTalk v1.4.0
+      <span class="logo">&#127752;</span> OrionTalk v1.5.0
     </div>
     <div class="sidebar-tabs">
       <div class="sidebar-tab active" data-tab="chats">对话</div>
@@ -619,7 +619,7 @@ body.dragging * { cursor: col-resize !important; }
 // ===== State (NO persistence) =====
 // Agent = AI role or Bot Agent. type: 'ai' | 'bot'
 let idCounter = 0;
-function uid() { return ++idCounter + '_' + Date.now(); }
+function uid() { return `${++idCounter}_${Date.now()}`; }
 
 let state = {
   agents: [],  // [{id, name, prompt, avatar, type:'ai'|'bot'}]
@@ -637,21 +637,19 @@ let isStreaming = false;
 let abortController = null;
 let typingIndicatorId = null;
 let discussTimeout = null;
-var autoReplyTimer = null;
-var autoReplyDelay = 3000;
+let autoReplyTimer = null;
+const autoReplyDelay = 3000;
 
 // ===== Helpers =====
 function escapeHtml(str) {
-  const div = document.createElement('div');
-  div.textContent = str;
-  return div.innerHTML;
+  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#x27;');
 }
 function escapeAttr(str) {
   return (str || '').replace(/"/g, '&quot;').replace(/'/g, '&#39;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 function formatTime(ts) {
   const d = new Date(ts);
-  return d.getHours().toString().padStart(2,'0') + ':' + d.getMinutes().toString().padStart(2,'0');
+  return `${d.getHours().toString().padStart(2,'0')}:${d.getMinutes().toString().padStart(2,'0')}`;
 }
 function scrollToBottom() {
   const area = document.getElementById('chatArea');
@@ -675,6 +673,108 @@ function setBotAgent(agent) {
   // Remove existing bot, add new one
   state.agents = state.agents.filter(function(a) { return a.type !== 'bot'; });
   if (agent) { agent.type = 'bot'; state.agents.push(agent); }
+}
+
+// ===== SSE Streaming Engine (shared by callApi and callApiForDiscussion) =====
+async function streamSse(options) {
+  const {
+    url, headers, body,
+    onFrame, onDone, onError,
+    indicatorId, stopBtnDisplay,
+    avatar, roleName,
+  } = options;
+
+  isStreaming = true;
+  abortController = new AbortController();
+
+  if (stopBtnDisplay) {
+    const stopBtn = document.getElementById('stopBtn');
+    if (stopBtn) stopBtn.style.display = 'flex';
+  }
+
+  const checkCancelled = () => typingIndicatorId !== indicatorId;
+
+  const indicator = document.createElement('div');
+  indicator.id = 'typing_' + indicatorId;
+  indicator.className = 'message ai';
+  indicator.innerHTML = `<div class="message-avatar">${avatar || '🤖'}</div>` +
+    `<div class="message-body"><div class="message-name">${roleName}</div>` +
+    `<div class="message-bubble"><div class="typing-indicator"><div class="dot"></div><div class="dot"></div><div class="dot"></div></div></div></div>`;
+
+  const chatArea = document.getElementById('chatArea');
+  if (chatArea) chatArea.appendChild(indicator);
+  scrollToBottom();
+
+  try {
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: headers,
+      body: JSON.stringify(body),
+      signal: abortController.signal,
+    });
+
+    if (!resp.ok) throw new Error(`API Error: ${resp.status} ${resp.statusText}`);
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let fullContent = '';
+
+    while (true) {
+      if (checkCancelled()) break;
+
+      let result;
+      try {
+        result = await reader.read();
+      } catch (e) {
+        if (e.name === 'AbortError') break;
+        throw e;
+      }
+      if (result.done) break;
+
+      buffer += decoder.decode(result.value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop();
+
+      for (let i = 0; i < lines.length; i++) {
+        const trimmed = lines[i].trim();
+        if (!trimmed || !trimmed.startsWith('data: ')) continue;
+        const data = trimmed.slice(6);
+        if (data === '[DONE]') break;
+
+        try {
+          const parsed = JSON.parse(data);
+          const delta = parsed.choices?.[0]?.delta?.content;
+          if (delta) {
+            fullContent += delta;
+            if (onFrame) onFrame(delta, fullContent, indicator);
+          }
+        } catch (_) {
+          // skip malformed JSON
+        }
+      }
+    }
+
+    if (indicator.parentNode) indicator.remove();
+    if (onDone) onDone(fullContent);
+    return { ok: true, content: fullContent };
+  } catch (e) {
+    if (indicator.parentNode) indicator.remove();
+    if (e.name === 'AbortError') {
+      if (onError) onError('abort');
+    } else {
+      console.error('SSE Error:', e);
+      if (onError) onError(e.message || String(e));
+    }
+    return { ok: false, content: '' };
+  } finally {
+    isStreaming = false;
+    abortController = null;
+    if (stopBtnDisplay) {
+      const stopBtn = document.getElementById('stopBtn');
+      if (stopBtn) stopBtn.style.display = 'none';
+    }
+  }
 }
 
 // ===== Defaults =====
@@ -720,17 +820,17 @@ function renderChatList() {
     const typeBadge = chat.type === 'group' ? '<span class="chat-type-badge">群聊</span>' : '<span class="chat-type-badge">单聊</span>';
     const lastMsg = chat.messages[chat.messages.length - 1];
     const preview = lastMsg ? lastMsg.content.substring(0, 30) : '';
-    return '<div class="chat-item' + (isActive ? ' active' : '') + '" data-chat-id="' + chat.id + '">' +
-      '<div class="chat-item-row">' +
-        '<span class="chat-type-badge">' + typeBadge + '</span>' +
-        '<span class="chat-title-text">' + escapeHtml(chat.title) + '</span>' +
-        '<div class="chat-item-actions">' +
-          '<button class="btn-icon rename-chat-btn" data-chat-id="' + chat.id + '" title="改名">✎</button>' +
-          '<button class="btn-icon delete-chat-btn" data-chat-id="' + chat.id + '" title="删除">✕</button>' +
-        '</div>' +
-      '</div>' +
-      '<div class="chat-item-preview">' + escapeHtml(preview) + '</div>' +
-      '</div>';
+    return `<div class="chat-item${isActive ? ' active' : ''}" data-chat-id="${chat.id}">
+      <div class="chat-item-row">
+        <span class="chat-type-badge">${typeBadge}</span>
+        <span class="chat-title-text">${escapeHtml(chat.title)}</span>
+        <div class="chat-item-actions">
+          <button class="btn-icon rename-chat-btn" data-chat-id="${chat.id}" title="改名">✎</button>
+          <button class="btn-icon delete-chat-btn" data-chat-id="${chat.id}" title="删除">✕</button>
+        </div>
+      </div>
+      <div class="chat-item-preview">${escapeHtml(preview)}</div>
+    </div>`;
   }).join('');
 }
 
@@ -742,31 +842,31 @@ function renderAgentList() {
   let html = '';
 
   // Section divider: Bot Agent (置顶)
-  html += '<div style="font-size:12px;color:var(--text-muted);padding:4px 0 4px;margin-bottom:4px;border-bottom:1px solid var(--border);">🤖 自动回复 Bot Agent（唯一，且自动创建）</div>';
+  html += `<div style="font-size:12px;color:var(--text-muted);padding:4px 0 4px;margin-bottom:4px;border-bottom:1px solid var(--border);">🤖 自动回复 Bot Agent（唯一，且自动创建）</div>`;
   if (botAgent) {
-    html += '<div class="agent-item bot-type" data-agent-id="' + botAgent.id + '">' +
-      '<div class="agent-avatar">' + (botAgent.avatar || '⚙️') + '</div>' +
-      '<div class="agent-info"><div class="agent-name">' + escapeHtml(botAgent.name) + '</div>' +
-        '<div class="agent-prompt">' + escapeHtml(botAgent.prompt.substring(0, 50)) + '</div></div>' +
-      '<span class="agent-type-tag" style="background:rgba(230,81,0,0.3);color:#ff9800;">Bot</span>' +
-      '<button class="btn-icon edit-agent-btn" data-agent-id="' + botAgent.id + '" title="编辑">✎</button>' +
-    '</div>';
+    html += `<div class="agent-item bot-type" data-agent-id="${botAgent.id}">
+      <div class="agent-avatar">${botAgent.avatar || '⚙️'}</div>
+      <div class="agent-info"><div class="agent-name">${escapeHtml(botAgent.name)}</div>
+        <div class="agent-prompt">${escapeHtml(botAgent.prompt.substring(0, 50))}</div></div>
+      <span class="agent-type-tag" style="background:rgba(230,81,0,0.3);color:#ff9800;">Bot</span>
+      <button class="btn-icon edit-agent-btn" data-agent-id="${botAgent.id}" title="编辑">✎</button>
+    </div>`;
   }
 
   // Section divider: AI Agents
-  html += '<div style="font-size:12px;color:var(--text-muted);padding:8px 0 4px;margin-top:8px;border-top:1px solid var(--border);border-bottom:1px solid var(--border);">AI Agent（用于对话）</div>';
+  html += `<div style="font-size:12px;color:var(--text-muted);padding:8px 0 4px;margin-top:8px;border-top:1px solid var(--border);border-bottom:1px solid var(--border);">AI Agent（用于对话）</div>`;
   if (!aiAgents.length) {
     html += '<div style="text-align:center;padding:8px;color:var(--text-muted);font-size:12px;">暂无</div>';
   } else {
     html += aiAgents.map(function(a) {
-      return '<div class="agent-item" data-agent-id="' + a.id + '">' +
-        '<div class="agent-avatar">' + (a.avatar || '🤖') + '</div>' +
-        '<div class="agent-info"><div class="agent-name">' + escapeHtml(a.name) + '</div>' +
-          '<div class="agent-prompt">' + escapeHtml(a.prompt.substring(0, 50)) + '</div></div>' +
-        '<span class="agent-type-tag">AI</span>' +
-        '<button class="btn-icon edit-agent-btn" data-agent-id="' + a.id + '" title="编辑">✎</button>' +
-        '<button class="btn-icon delete-agent-btn" data-agent-id="' + a.id + '" title="删除">✕</button>' +
-      '</div>';
+      return `<div class="agent-item" data-agent-id="${a.id}">
+        <div class="agent-avatar">${a.avatar || '🤖'}</div>
+        <div class="agent-info"><div class="agent-name">${escapeHtml(a.name)}</div>
+          <div class="agent-prompt">${escapeHtml(a.prompt.substring(0, 50))}</div></div>
+        <span class="agent-type-tag">AI</span>
+        <button class="btn-icon edit-agent-btn" data-agent-id="${a.id}" title="编辑">✎</button>
+        <button class="btn-icon delete-agent-btn" data-agent-id="${a.id}" title="删除">✕</button>
+      </div>`;
     }).join('');
   }
 
@@ -776,34 +876,34 @@ function renderAgentList() {
 function renderApiConfig() {
   const el = document.getElementById('apiList');
   const a = state.api;
-  var isAgens = a.name === 'Agens' || a.baseUrl.includes('agnes');
+  const isAgens = a.name === 'Agens' || a.baseUrl.includes('agnes');
   el.innerHTML =
-    '<div class="api-config-card">' +
-      '<div class="field"><label>提供商</label>' +
-        '<select id="apiProvider">' +
-          '<option value="agens"' + (isAgens ? ' selected' : '') + '>Agens</option>' +
-          '<option value="deepseek"' + (!isAgens ? ' selected' : '') + '>DeepSeek</option>' +
-        '</select>' +
-      '</div>' +
-      '<div class="field"><label>API Key</label>' +
-        '<input type="password" id="apiKey" value="' + escapeAttr(a.key) + '" placeholder="sk-...">' +
-      '</div>' +
-      '<div class="field"><label>Base URL</label>' +
-        '<input type="text" id="apiBaseUrl" value="' + escapeAttr(a.baseUrl) + '" placeholder="https://api.deepseek.com/v1/chat/completions">' +
-      '</div>' +
-      '<div class="field"><label>模型</label>' +
-        '<select id="apiModel">' +
-          '<option value="agnes-2.0-flash"' + (a.model==='agnes-2.0-flash'?' selected':'') + '>agnes-2.0-flash</option>' +
-          '<option value="deepseek-v4-pro"' + (a.model==='deepseek-v4-pro'?' selected':'') + '>deepseek-v4-pro</option>' +
-          '<option value="deepseek-v4-flash"' + (a.model==='deepseek-v4-flash'?' selected':'') + '>deepseek-v4-flash</option>' +
-        '</select>' +
-      '</div>' +
-      '<div style="display:flex;gap:8px;margin-top:8px;">' +
-        '<button class="btn btn-primary btn-sm" id="saveApiBtn">✓ 保存</button>' +
-        '<button class="btn btn-ghost btn-sm" id="testApiBtn">⚡ 测试连接</button>' +
-      '</div>' +
-      '<div class="api-status" id="apiStatus"></div>' +
-    '</div>';
+    `<div class="api-config-card">
+      <div class="field"><label>提供商</label>
+        <select id="apiProvider">
+          <option value="agens"${isAgens ? ' selected' : ''}>Agens</option>
+          <option value="deepseek"${!isAgens ? ' selected' : ''}>DeepSeek</option>
+        </select>
+      </div>
+      <div class="field"><label>API Key</label>
+        <input type="password" id="apiKey" value="${escapeAttr(a.key)}" placeholder="sk-...">
+      </div>
+      <div class="field"><label>Base URL</label>
+        <input type="text" id="apiBaseUrl" value="${escapeAttr(a.baseUrl)}" placeholder="https://api.deepseek.com/v1/chat/completions">
+      </div>
+      <div class="field"><label>模型</label>
+        <select id="apiModel">
+          <option value="agnes-2.0-flash"${a.model==='agnes-2.0-flash'?' selected':''}>agnes-2.0-flash</option>
+          <option value="deepseek-v4-pro"${a.model==='deepseek-v4-pro'?' selected':''}>deepseek-v4-pro</option>
+          <option value="deepseek-v4-flash"${a.model==='deepseek-v4-flash'?' selected':''}>deepseek-v4-flash</option>
+        </select>
+      </div>
+      <div style="display:flex;gap:8px;margin-top:8px;">
+        <button class="btn btn-primary btn-sm" id="saveApiBtn">✓ 保存</button>
+        <button class="btn btn-ghost btn-sm" id="testApiBtn">⚡ 测试连接</button>
+      </div>
+      <div class="api-status" id="apiStatus"></div>
+    </div>`;
 }
 
 function renderChatHeader() {
@@ -815,20 +915,20 @@ function renderChatHeader() {
   if (chat.type === 'single') {
     const agent = state.agents.find(function(a) { return a.id === chat.agentIds[0]; });
     document.getElementById('chatSubtitle').textContent = agent ? agent.name : '';
-    var arBtn = document.getElementById('autoReplyInputBtn');
+    const arBtn = document.getElementById('autoReplyInputBtn');
     if (arBtn) { arBtn.style.display = 'flex'; arBtn.classList.toggle('on', !!chat.autoReply); arBtn.innerHTML = (!!chat.autoReply ? '&#10003; ' : '&#9881; ') + '自动回复'; }
-    var dBtn = document.getElementById('discussInputBtn');
+    const dBtn = document.getElementById('discussInputBtn');
     if (dBtn) dBtn.style.display = 'none';
   } else {
     const agentNames = chat.agentIds.map(function(id) {
       const a = state.agents.find(function(x) { return x.id === id; });
       return a ? a.name : '';
     }).filter(Boolean);
-    document.getElementById('chatSubtitle').textContent = '群聊: ' + agentNames.join(', ');
+    document.getElementById('chatSubtitle').textContent = `群聊: ${agentNames.join(', ')}`;
     // 群聊只显示自由讨论按钮，不显示自动回复按钮
-    var arBtn = document.getElementById('autoReplyInputBtn');
+    const arBtn = document.getElementById('autoReplyInputBtn');
     if (arBtn) arBtn.style.display = 'none';
-    var dBtn = document.getElementById('discussInputBtn');
+    const dBtn = document.getElementById('discussInputBtn');
     if (dBtn) { dBtn.style.display = 'flex'; dBtn.classList.toggle('on', !!chat.discussing); dBtn.innerHTML = (!!chat.discussing ? '&#10003; ' : '&#128269; ') + '自由讨论'; }
   }
 }
@@ -844,7 +944,7 @@ function renderMessages() {
       if (agent) {
         const welcome = document.createElement('div');
         welcome.className = 'welcome-msg';
-        welcome.innerHTML = '<div class="title">' + escapeHtml(agent.name) + '</div><div>' + escapeHtml(agent.prompt) + '</div>';
+        welcome.innerHTML = `<div class="title">${escapeHtml(agent.name)}</div><div>${escapeHtml(agent.prompt)}</div>`;
         area.appendChild(welcome);
       }
     }
@@ -878,7 +978,7 @@ function createMessageElement(msg) {
   if (isUser) name.textContent = '你';
   else if (isBot) { const b = getBotAgent(); name.textContent = b ? b.name : 'Bot'; }
   else {
-    var a = state.agents.find(function(x) { return x.id === msg.agentId; });
+    const a = state.agents.find(function(x) { return x.id === msg.agentId; });
     name.textContent = a ? a.name : 'AI';
   }
   const bubble = document.createElement('div'); bubble.className = 'message-bubble';
@@ -937,7 +1037,7 @@ function deleteChat(chatId) {
 function startRenameChat(chatId) {
   const chat = state.chats.find(function(c) { return c.id === chatId; });
   if (!chat) return;
-  const chatItem = document.querySelector('.chat-item[data-chat-id="' + chatId + '"]');
+  const chatItem = document.querySelector(`.chat-item[data-chat-id="${chatId}"]`);
   if (!chatItem) return;
   const titleSpan = chatItem.querySelector('.chat-title-text');
   if (!titleSpan) return;
@@ -985,7 +1085,7 @@ function deleteAgent(agentId) {
 function switchTab(tabName) {
   document.querySelectorAll('.sidebar-tab').forEach(function(t) { t.classList.remove('active'); });
   document.querySelectorAll('.sidebar-panel').forEach(function(p) { p.classList.remove('active'); });
-  const tabEl = document.querySelector('.sidebar-tab[data-tab="' + tabName + '"]');
+  const tabEl = document.querySelector(`.sidebar-tab[data-tab="${tabName}"]`);
   if (tabEl) tabEl.classList.add('active');
   const panelMap = { chats: 'panelChats', agents: 'panelAgents', api: 'panelApi', config: 'panelConfig' };
   if (panelMap[tabName]) document.getElementById(panelMap[tabName]).classList.add('active');
@@ -1008,18 +1108,18 @@ document.getElementById('modalOverlay').addEventListener('click', function(e) {
 function showNewChatModal() {
   const aiAgents = getAiAgents();
   const rolesOptions = aiAgents.map(function(r) {
-    return '<option value="' + r.id + '">' + escapeHtml(r.name) + '</option>';
+    return `<option value="${r.id}">${escapeHtml(r.name)}</option>`;
   }).join('');
-  showModal('<h3>新建对话 <span class="modal-close" onclick="hideModal()">&times;</span></h3>' +
-    '<div class="form-group"><label>类型</label>' +
-      '<select id="newChatType"><option value="single">单聊</option><option value="group">群聊</option></select>' +
-    '</div>' +
-    '<div id="chatAgentSelection"><div class="form-group"><label>选择 Agent</label>' +
-      '<select id="newChatAgent">' + rolesOptions + '</select></div></div>' +
-    '<div class="modal-actions">' +
-      '<button class="btn btn-ghost close-modal-btn" onclick="hideModal()">取消</button>' +
-      '<button class="btn btn-primary create-chat-confirm-btn">创建</button>' +
-    '</div>');
+  showModal(`<h3>新建对话 <span class="modal-close" onclick="hideModal()">&times;</span></h3>
+    <div class="form-group"><label>类型</label>
+      <select id="newChatType"><option value="single">单聊</option><option value="group">群聊</option></select>
+    </div>
+    <div id="chatAgentSelection"><div class="form-group"><label>选择 Agent</label>
+      <select id="newChatAgent">${rolesOptions}</select></div></div>
+    <div class="modal-actions">
+      <button class="btn btn-ghost close-modal-btn" onclick="hideModal()">取消</button>
+      <button class="btn btn-primary create-chat-confirm-btn">创建</button>
+    </div>`);
 
   document.getElementById('newChatType').addEventListener('change', function() {
     document.getElementById('chatAgentSelection').style.display = this.value === 'single' ? 'block' : 'none';
@@ -1041,18 +1141,18 @@ function showNewChatModal() {
 function createGroupChatModal() {
   const aiAgents = getAiAgents();
   const agentOptions = aiAgents.map(function(a) {
-    return '<div class="agent-item" data-agent-id="' + a.id + '">' +
-      '<div class="agent-avatar">' + (a.avatar || '🤖') + '</div>' +
-      '<div class="agent-info"><div class="agent-name">' + escapeHtml(a.name) + '</div></div>' +
-    '</div>';
+    return `<div class="agent-item" data-agent-id="${a.id}">
+      <div class="agent-avatar">${a.avatar || '🤖'}</div>
+      <div class="agent-info"><div class="agent-name">${escapeHtml(a.name)}</div></div>
+    </div>`;
   }).join('');
-  showModal('<h3>新建群聊 <span class="modal-close" onclick="hideModal()">&times;</span></h3>' +
-    '<p style="font-size:13px;color:var(--text-muted);margin-bottom:12px;">选择参与的 Agent（点击选择，至少2个）</p>' +
-    '<div id="groupAgentList">' + agentOptions + '</div>' +
-    '<div class="modal-actions">' +
-      '<button class="btn btn-ghost close-modal-btn" onclick="hideModal()">取消</button>' +
-      '<button class="btn btn-primary create-group-confirm-btn">创建</button>' +
-    '</div>');
+  showModal(`<h3>新建群聊 <span class="modal-close" onclick="hideModal()">&times;</span></h3>
+    <p style="font-size:13px;color:var(--text-muted);margin-bottom:12px;">选择参与的 Agent（点击选择，至少2个）</p>
+    <div id="groupAgentList">${agentOptions}</div>
+    <div class="modal-actions">
+      <button class="btn btn-ghost close-modal-btn" onclick="hideModal()">取消</button>
+      <button class="btn btn-primary create-group-confirm-btn">创建</button>
+    </div>`);
 
   document.querySelectorAll('#groupAgentList .agent-item').forEach(function(item) {
     item.addEventListener('click', function() {
@@ -1077,14 +1177,14 @@ function showAgentModal(editAgent, isNew) {
   const isBot = a.type === 'bot';
   const title = isBot ? '编辑 Bot Agent' : (isNew ? '新建 Agent' : '编辑 Agent');
 
-  showModal('<h3>' + title + ' <span class="modal-close" onclick="hideModal()">&times;</span></h3>' +
-    '<div class="form-group"><label>名称</label><input type="text" id="agentName" value="' + escapeAttr(a.name) + '" placeholder="Agent名称"></div>' +
-    '<div class="form-group"><label>头像 Emoji</label><input type="text" id="agentAvatar" value="' + escapeAttr(a.avatar) + '" placeholder="🤖"></div>' +
-    '<div class="form-group"><label>System Prompt</label><textarea id="agentPrompt" placeholder="Agent的行为设定...">' + escapeHtml(a.prompt) + '</textarea></div>' +
-    '<div class="modal-actions">' +
-      '<button class="btn btn-ghost close-modal-btn" onclick="hideModal()">取消</button>' +
-      '<button class="btn btn-primary agent-confirm-btn">' + (editAgent ? '保存' : '创建') + '</button>' +
-    '</div>');
+  showModal(`<h3>${title} <span class="modal-close" onclick="hideModal()">&times;</span></h3>
+    <div class="form-group"><label>名称</label><input type="text" id="agentName" value="${escapeAttr(a.name)}" placeholder="Agent名称"></div>
+    <div class="form-group"><label>头像 Emoji</label><input type="text" id="agentAvatar" value="${escapeAttr(a.avatar)}" placeholder="🤖"></div>
+    <div class="form-group"><label>System Prompt</label><textarea id="agentPrompt" placeholder="Agent的行为设定...">${escapeHtml(a.prompt)}</textarea></div>
+    <div class="modal-actions">
+      <button class="btn btn-ghost close-modal-btn" onclick="hideModal()">取消</button>
+      <button class="btn btn-primary agent-confirm-btn">${editAgent ? '保存' : '创建'}</button>
+    </div>`);
 
   document.querySelector('.agent-confirm-btn').addEventListener('click', function() {
     const name = document.getElementById('agentName').value.trim();
@@ -1105,25 +1205,22 @@ function showAgentModal(editAgent, isNew) {
   });
 }
 
-// ===== Document-level Event Delegation =====
+// ===== Unified Event Delegation =====
 document.addEventListener('click', function(e) {
-  // Delete chat — must be before chat-item to prevent switch
+  // --- Chat operations ---
   const delChat = e.target.closest('.delete-chat-btn');
   if (delChat) { e.stopPropagation(); deleteChat(delChat.dataset.chatId); return; }
 
-  // Rename chat — must be before chat-item to prevent switch
   const renameChat = e.target.closest('.rename-chat-btn');
   if (renameChat) { e.stopPropagation(); startRenameChat(renameChat.dataset.chatId); return; }
 
-  // Chat list click
   const chatItem = e.target.closest('.chat-item');
   if (chatItem) { switchChat(chatItem.dataset.chatId); return; }
 
-  // Delete agent
+  // --- Agent operations ---
   const delAgent = e.target.closest('.delete-agent-btn');
   if (delAgent) { e.stopPropagation(); deleteAgent(delAgent.dataset.agentId); return; }
 
-  // Edit agent
   const editAgent = e.target.closest('.edit-agent-btn');
   if (editAgent) {
     e.stopPropagation();
@@ -1132,17 +1229,80 @@ document.addEventListener('click', function(e) {
     return;
   }
 
-  // New chat
+  // --- New chat / new agent ---
   if (e.target.closest('#newChatBtn')) { showNewChatModal(); return; }
-
-  // New agent — always creates AI Agent by default (Bot Agent is auto-managed)
   if (e.target.closest('#newAgentBtn') || e.target.id === 'newAgentBtn') {
     showAgentModal({ name: '', prompt: '', avatar: '🤖', type: 'ai' }, true);
     return;
   }
 
-  // Stop button
+  // --- Stop streaming ---
   if (e.target.closest('#stopBtn')) { stopStreaming(); return; }
+
+  // --- API config ---
+  const saveApiBtn = e.target.closest('#saveApiBtn');
+  if (saveApiBtn) {
+    const provider = document.getElementById('apiProvider').value;
+    let baseUrlVal = document.getElementById('apiBaseUrl').value.trim();
+    if (!baseUrlVal) {
+      baseUrlVal = provider === 'agens'
+        ? 'https://apihub.agnes-ai.com/v1/chat/completions'
+        : 'https://api.deepseek.com/v1/chat/completions';
+    }
+    baseUrlVal = baseUrlVal.replace(/\/+$/, '');
+    if (!baseUrlVal.endsWith('/chat/completions')) {
+      baseUrlVal += '/chat/completions';
+    }
+    state.api.name = provider === 'agens' ? 'Agens' : 'DeepSeek';
+    state.api.key = document.getElementById('apiKey').value.trim();
+    state.api.baseUrl = baseUrlVal;
+    state.api.model = document.getElementById('apiModel').value;
+    setStatus('已保存', '');
+    return;
+  }
+
+  if (e.target.closest('#testApiBtn')) { testApiConnection(); return; }
+
+  if (e.target.id === 'apiProvider') {
+    const provider = e.target.value;
+    const baseUrlInput = document.getElementById('apiBaseUrl');
+    if (provider === 'agens') {
+      baseUrlInput.value = 'https://apihub.agnes-ai.com/v1/chat/completions';
+      document.getElementById('apiModel').value = 'agnes-2.0-flash';
+    } else {
+      baseUrlInput.value = 'https://api.deepseek.com/v1/chat/completions';
+      document.getElementById('apiModel').value = 'deepseek-v4-flash';
+    }
+  }
+
+  // --- Control buttons (auto-reply / discuss) ---
+  const arBtn = e.target.closest('#autoReplyInputBtn');
+  if (arBtn) {
+    const chat = getActiveChat();
+    if (chat && chat.type === 'single') {
+      chat.autoReply = !chat.autoReply;
+      renderChatHeader();
+      if (chat.autoReply) startAutoReply(chat);
+      else { if (autoReplyTimer) { clearInterval(autoReplyTimer); autoReplyTimer = null; } }
+    }
+    return;
+  }
+
+  const dBtn = e.target.closest('#discussInputBtn');
+  if (dBtn) {
+    const chat = getActiveChat();
+    if (chat && chat.type === 'group') {
+      chat.discussing = !chat.discussing;
+      if (!chat.discussing) {
+        if (discussTimeout) { clearTimeout(discussTimeout); discussTimeout = null; }
+      } else {
+        console.log('[FreeDiscussion] Starting discussion for chat:', chat.id);
+        startDiscussionRoundRobin(chat);
+      }
+      renderChatHeader();
+    }
+    return;
+  }
 });
 
 // Sidebar tabs
@@ -1160,7 +1320,7 @@ document.querySelectorAll('.sidebar-tab').forEach(function(tab) {
 // Sidebar toggle button — always visible on mobile
 // Sidebar toggle button — always visible on mobile/desktop
 document.getElementById('mobileHamburger').addEventListener('click', function() {
-  var sidebar = document.getElementById('sidebar');
+  const sidebar = document.getElementById('sidebar');
   if (window.innerWidth <= 768) {
     sidebar.classList.toggle('open');
   } else {
@@ -1169,8 +1329,8 @@ document.getElementById('mobileHamburger').addEventListener('click', function() 
 });
 
 // Resize handle
-var resizeHandle = document.getElementById('resizeHandle');
-var isResizing = false;
+const resizeHandle = document.getElementById('resizeHandle');
+let isResizing = false;
 resizeHandle.addEventListener('mousedown', function(e) {
   isResizing = true;
   document.body.classList.add('dragging');
@@ -1178,66 +1338,31 @@ resizeHandle.addEventListener('mousedown', function(e) {
 });
 document.addEventListener('mousemove', function(e) {
   if (!isResizing) return;
-  var sidebar = document.getElementById('sidebar');
-  var newWidth = Math.max(200, Math.min(500, e.clientX));
-  sidebar.style.width = newWidth + 'px';
-  sidebar.style.setProperty('--sidebar-width', newWidth + 'px');
+  const sidebar = document.getElementById('sidebar');
+  const newWidth = Math.max(200, Math.min(500, e.clientX));
+  sidebar.style.width = `${newWidth}px`;
+  sidebar.style.setProperty('--sidebar-width', `${newWidth}px`);
 });
 document.addEventListener('mouseup', function() {
   if (isResizing) { isResizing = false; document.body.classList.remove('dragging'); }
 });
 
 // ===== API: Provider switch & Save & Test =====
-document.addEventListener('click', function(e) {
-  if (e.target.id === 'saveApiBtn') {
-    var provider = document.getElementById('apiProvider').value;
-    var baseUrlVal = document.getElementById('apiBaseUrl').value.trim();
-    if (!baseUrlVal) {
-      baseUrlVal = provider === 'agens' ? 'https://apihub.agnes-ai.com/v1/chat/completions' : 'https://api.deepseek.com/v1/chat/completions';
-    }
-    // 去掉末尾 /，确保以 /chat/completions 结尾
-    baseUrlVal = baseUrlVal.replace(/\/+$/, '');
-    if (!baseUrlVal.endsWith('/chat/completions')) {
-      baseUrlVal += '/chat/completions';
-    }
-    state.api.name = provider === 'agens' ? 'Agens' : 'DeepSeek';
-    state.api.key = document.getElementById('apiKey').value.trim();
-    state.api.baseUrl = baseUrlVal;
-    state.api.model = document.getElementById('apiModel').value;
-    setStatus('已保存', '');
-    return;
-  }
-  if (e.target.id === 'testApiBtn') { testApiConnection(); return; }
-
-  // Provider switch — auto fill URL and model
-  if (e.target.id === 'apiProvider') {
-    var provider = e.target.value;
-    var baseUrlInput = document.getElementById('apiBaseUrl');
-    if (provider === 'agens') {
-      baseUrlInput.value = 'https://apihub.agnes-ai.com/v1/chat/completions';
-      document.getElementById('apiModel').value = 'agnes-2.0-flash';
-    } else {
-      baseUrlInput.value = 'https://api.deepseek.com/v1/chat/completions';
-      document.getElementById('apiModel').value = 'deepseek-v4-flash';
-    }
-  }
-});
-
 async function testApiConnection() {
-  var statusEl = document.getElementById('apiStatus');
+  const statusEl = document.getElementById('apiStatus');
   if (!statusEl) return;
   statusEl.className = 'api-status checking';
   statusEl.textContent = '⏳ 正在测试...';
-  var key = document.getElementById('apiKey').value.trim();
-  var baseUrl = document.getElementById('apiBaseUrl').value.trim();
-  var model = document.getElementById('apiModel').value;
+  const key = document.getElementById('apiKey').value.trim();
+  const baseUrl = document.getElementById('apiBaseUrl').value.trim();
+  const model = document.getElementById('apiModel').value;
   if (!key) {
     statusEl.className = 'api-status error';
     statusEl.textContent = '✗ 请先填写 API Key';
     return;
   }
   try {
-    var resp = await fetch(baseUrl, {
+    const resp = await fetch(baseUrl, {
       method: 'POST',
       headers: { 'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json' },
       body: JSON.stringify({ model: model, messages: [{ role: 'user', content: 'hi' }], max_tokens: 10 })
@@ -1246,9 +1371,9 @@ async function testApiConnection() {
       statusEl.className = 'api-status connected';
       statusEl.textContent = '✓ 连接成功！';
     } else {
-      var text = await resp.text();
+      const text = await resp.text();
       statusEl.className = 'api-status error';
-      statusEl.textContent = '✗ 错误 ' + resp.status + ': ' + text.substring(0, 100);
+      statusEl.textContent = `✗ 错误 ${resp.status}: ${text.substring(0, 100)}`;
     }
   } catch(err) {
     statusEl.className = 'api-status error';
@@ -1257,7 +1382,7 @@ async function testApiConnection() {
 }
 
 function setStatus(text, cls) {
-  var el = document.getElementById('apiStatus');
+  const el = document.getElementById('apiStatus');
   if (!el) return;
   el.textContent = text;
   el.className = 'api-status ' + cls;
@@ -1265,7 +1390,7 @@ function setStatus(text, cls) {
 
 // ===== Send Message =====
 async function sendMessage(content) {
-  var chat = getActiveChat();
+  const chat = getActiveChat();
   if (!chat) return;
   // Group chat: pause free discussion while sending user message
   if (chat.type === 'group' && chat.discussing) {
@@ -1273,13 +1398,13 @@ async function sendMessage(content) {
     if (discussTimeout) { clearTimeout(discussTimeout); discussTimeout = null; }
   }
   if (isStreaming) return;
-  var msg = { role: 'user', content: content, timestamp: Date.now() };
+  const msg = { role: 'user', content: content, timestamp: Date.now() };
   chat.messages.push(msg);
   if (chat.messages.filter(function(m) { return m.role === 'user'; }).length === 1) {
     chat.title = content.substring(0, 20) + (content.length > 20 ? '...' : '');
   }
   renderMessages();
-  var apiMessages = buildApiMessages(chat);
+  const apiMessages = buildApiMessages(chat);
   await callApi(chat, apiMessages);
   // Group chat: restore free discussion after message is processed
   if (chat.type === 'group' && chat.discussing) {
@@ -1288,145 +1413,75 @@ async function sendMessage(content) {
 }
 
 function buildApiMessages(chat) {
-  var msgs = [];
+  const msgs = [];
   // Single chat: system prompt from the AI agent
   if (chat.type === 'single' && chat.agentIds.length) {
-    var agent = state.agents.find(function(a) { return a.id === chat.agentIds[0]; });
+    const agent = state.agents.find(function(a) { return a.id === chat.agentIds[0]; });
     if (agent && agent.type === 'ai') msgs.push({ role: 'system', content: agent.prompt });
   }
   // Group chat: system prompt for the FIRST agent (who responds to user messages)
   if (chat.type === 'group' && chat.agentIds.length) {
-    var gAgent = state.agents.find(function(a) { return a.id === chat.agentIds[0]; });
+    const gAgent = state.agents.find(function(a) { return a.id === chat.agentIds[0]; });
     if (gAgent && gAgent.type === 'ai') msgs.push({ role: 'system', content: gAgent.prompt });
   }
   chat.messages.forEach(function(m) {
     if (m.role === 'user') msgs.push({ role: 'user', content: m.content });
     else if (m.role === 'assistant') msgs.push({ role: 'assistant', content: m.content });
-    else if (m.role === 'bot') msgs.push({ role: 'user', content: m.content });
+    else if (m.role === 'bot') msgs.push({ role: 'user', content: '[自动回复 Bot] ' + m.content });
   });
   return msgs;
 }
 
 async function callApi(chat, apiMessages) {
-  isStreaming = true;
-  abortController = new AbortController();
-  if (chat.type !== 'group') document.getElementById('stopBtn').style.display = 'flex';
-  var indicatorId = ++idCounter;
-  typingIndicatorId = indicatorId;
-  var indicator = document.createElement('div');
-  indicator.id = 'typing_' + indicatorId;
-  indicator.className = 'message ai';
-  var roleName = chat.type === 'single' ?
-    (state.agents.find(function(r){return r.id===chat.agentIds[0]})?.name || 'AI') :
-    (state.agents.find(function(r){return r.id===chat.agentIds[0]})?.name || 'AI');
-  indicator.innerHTML = '<div class="message-avatar">🤖</div>' +
-    '<div class="message-body"><div class="message-name">' + roleName + '</div>' +
-    '<div class="message-bubble"><div class="typing-indicator"><div class="dot"></div><div class="dot"></div><div class="dot"></div></div></div></div>';
-  document.getElementById('chatArea').appendChild(indicator);
-  scrollToBottom();
-  try {
-    var resp = await fetch(state.api.baseUrl, {
-      method: 'POST',
-      headers: { 'Authorization': 'Bearer ' + state.api.key, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: state.api.model, messages: apiMessages, stream: true }),
-      signal: abortController.signal
-    });
-    if (!resp.ok) throw new Error('API Error: ' + resp.status + ' ' + resp.statusText);
-    var reader = resp.body.getReader();
-    var decoder = new TextDecoder();
-    var buffer = '';
-    var fullContent = '';
-    var aiMsg = { role: 'assistant', content: '', timestamp: Date.now(), agentId: chat.agentIds[0] };
-    // Ensure agentId points to a valid AI agent (not a deleted or bot agent)
-    if (aiMsg.agentId) {
-      var _resolved = state.agents.find(function(a) { return a.id === aiMsg.agentId && a.type === 'ai'; });
-      if (!_resolved) {
-        // Fallback: find the first valid AI agent in this chat's agent list
-        for (var _fi = 0; _fi < chat.agentIds.length; _fi++) {
-          var _fa = state.agents.find(function(x) { return x.id === chat.agentIds[_fi] && x.type === 'ai'; });
-          if (_fa) { aiMsg.agentId = _fa.id; break; }
-        }
+  const agent = state.agents.find(function(a) { return a.id === chat.agentIds[0]; });
+  const roleName = agent ? agent.name : 'AI';
+  const agentId = chat.agentIds[0];
+
+  // Resolve agentId to a valid AI agent
+  let resolvedAgentId = agentId;
+  if (agentId) {
+    const resolved = state.agents.find(function(a) { return a.id === agentId && a.type === 'ai'; });
+    if (!resolved) {
+      for (let fi = 0; fi < chat.agentIds.length; fi++) {
+        const fa = state.agents.find(function(x) { return x.id === chat.agentIds[fi] && x.type === 'ai'; });
+        if (fa) { resolvedAgentId = fa.id; break; }
       }
     }
-    while (true) {
-      if (typingIndicatorId !== indicatorId) break;
-      var result = await reader.read();
-      if (result.done) break;
-      buffer += decoder.decode(result.value, { stream: true });
-      var lines = buffer.split('\n');
-      buffer = lines.pop();
-      for (var i = 0; i < lines.length; i++) {
-        var trimmed = lines[i].trim();
-        if (!trimmed || !trimmed.startsWith('data: ')) continue;
-        var data = trimmed.slice(6);
-        if (data === '[DONE]') break;
-        try {
-          var parsed = JSON.parse(data);
-          var delta = parsed.choices?.[0]?.delta?.content;
-          if (delta) {
-            fullContent += delta;
-            aiMsg.content = fullContent;
-            var displayContent = (stripPrefix && fullContent.match(/^\[[^\]]+\]\s*/)) ? fullContent.replace(/^\[[^\]]+\]\s*/, '') : fullContent;
-            var bubble = indicator.querySelector('.message-bubble');
-            if (bubble) bubble.innerHTML = renderMarkdown(displayContent) + '<div class="typing-indicator"><div class="dot"></div><div class="dot"></div><div class="dot"></div></div>';
-            scrollToBottom();
-          }
-        } catch(e) {}
-      }
-    }
-    if (indicator.parentNode) indicator.remove();
-    chat.messages.push(aiMsg);
-    renderMessages();
-  } catch(e) {
-    if (indicator.parentNode) indicator.remove();
-    if (e.name === 'AbortError') {
-      chat.messages.push({ role: 'system', content: '已停止回复', timestamp: Date.now() });
-    } else {
-      console.error('API Error:', e);
-      chat.messages.push({ role: 'system', content: '错误: ' + e.message, timestamp: Date.now() });
-    }
-    renderMessages();
-  } finally {
-    isStreaming = false;
-    abortController = null;
-    typingIndicatorId = null;
-    document.getElementById('stopBtn').style.display = 'none';
   }
+
+  const indicatorId = ++idCounter;
+  typingIndicatorId = indicatorId;
+
+  const result = await streamSse({
+    url: state.api.baseUrl,
+    headers: { 'Authorization': 'Bearer ' + state.api.key, 'Content-Type': 'application/json' },
+    body: { model: state.api.model, messages: apiMessages, stream: true },
+    indicatorId: indicatorId,
+    stopBtnDisplay: chat.type !== 'group',
+    roleName: roleName,
+    onFrame: function(delta, fullContent, indicator) {
+      const bubble = indicator.querySelector('.message-bubble');
+      if (bubble) bubble.innerHTML = renderMarkdown(fullContent) + `<div class="typing-indicator"><div class="dot"></div><div class="dot"></div><div class="dot"></div></div>`;
+      scrollToBottom();
+    },
+    onDone: function(fullContent) {
+      const aiMsg = { role: 'assistant', content: fullContent, timestamp: Date.now(), agentId: resolvedAgentId };
+      chat.messages.push(aiMsg);
+      renderMessages();
+    },
+    onError: function(err) {
+      if (err === 'abort') {
+        chat.messages.push({ role: 'system', content: '已停止回复', timestamp: Date.now() });
+      } else {
+        console.error('API Error:', err);
+        chat.messages.push({ role: 'system', content: '错误: ' + err, timestamp: Date.now() });
+      }
+      renderMessages();
+    },
+  });
 }
 
 function stopStreaming() { if (abortController) abortController.abort(); }
-
-// ===== Button toggle handlers =====
-document.addEventListener('click', function(e) {
-  // Auto reply toggle (input area) — single chat only
-  var arBtn = e.target.closest('#autoReplyInputBtn');
-  if (arBtn) {
-    var chat = getActiveChat();
-    if (chat && chat.type === 'single') {
-      chat.autoReply = !chat.autoReply;
-      renderChatHeader();
-      if (chat.autoReply) startAutoReply(chat);
-      else { if (autoReplyTimer) { clearInterval(autoReplyTimer); autoReplyTimer = null; } }
-    }
-    return;
-  }
-  // Discuss toggle (group only)
-  var dBtn = e.target.closest('#discussInputBtn');
-  if (dBtn) {
-    var chat = getActiveChat();
-    if (chat && chat.type === 'group') {
-      chat.discussing = !chat.discussing;
-      if (!chat.discussing) {
-        if (discussTimeout) { clearTimeout(discussTimeout); discussTimeout = null; }
-      } else {
-        console.log('[FreeDiscussion] Starting discussion for chat:', chat.id);
-        startDiscussionRoundRobin(chat);
-      }
-      renderChatHeader();
-    }
-    return;
-  }
-});
 
 // ===== Discussion Round Robin =====
 async function startDiscussionRoundRobin(chat) {
@@ -1434,21 +1489,21 @@ async function startDiscussionRoundRobin(chat) {
   // Wait for any ongoing streaming to finish before starting
   if (isStreaming) {
     await new Promise(function(resolve) {
-      var check = setInterval(function() {
+      const check = setInterval(function() {
         if (!isStreaming) { clearInterval(check); resolve(); }
       }, 100);
     });
   }
-  var roleIds = chat.agentIds;
-  var totalRoles = roleIds.length;
+  const roleIds = chat.agentIds;
+  const totalRoles = roleIds.length;
 
   // Infer roleIndex from conversation history — don't start from 0
-  var roleIndex = 0;
-  var lastAssistantIdx = -1;
-  for (var h = chat.messages.length - 1; h >= 0; h--) {
-    var m = chat.messages[h];
+  let roleIndex = 0;
+  let lastAssistantIdx = -1;
+  for (let h = chat.messages.length - 1; h >= 0; h--) {
+    const m = chat.messages[h];
     if (m.role === 'assistant' && m.agentId) {
-      var idx = roleIds.indexOf(m.agentId);
+      const idx = roleIds.indexOf(m.agentId);
       if (idx >= 0) {
         lastAssistantIdx = idx;
         break;
@@ -1465,8 +1520,8 @@ async function startDiscussionRoundRobin(chat) {
       discussTimeout = setTimeout(speakNext, 500);
       return;
     }
-    var agentId = roleIds[roleIndex % totalRoles];
-    var agent = state.agents.find(function(a) { return a.id === agentId && a.type === 'ai'; });
+    let agentId = roleIds[roleIndex % totalRoles];
+    const agent = state.agents.find(function(a) { return a.id === agentId && a.type === 'ai'; });
     if (!agent) {
       roleIndex++;
       discussTimeout = setTimeout(speakNext, 1000);
@@ -1475,16 +1530,16 @@ async function startDiscussionRoundRobin(chat) {
 
     // Identity-bound system prompt: 从 agent 元数据构造，不依赖 prompt 文本
     // 确保每条请求都重新注入 system，防止 LLM 遗忘身份
-    var roleDefinition = '你是 ' + agent.name + '。' + agent.prompt;
-    var identityPrompt = roleDefinition + '\n\n【重要规则】\n- 你是一个有固定观点的角色，你的观点从始至终不会改变\n- 不要认同或模仿其他角色的观点\n- 直接表达你自己的看法，简洁自然';
-    var apiMessages = [{ role: 'system', content: identityPrompt }];
+    const roleDefinition = `你是 ${agent.name}。${agent.prompt}`;
+    const identityPrompt = `${roleDefinition}\n\n【重要规则】\n- 你是一个有固定观点的角色，你的观点从始至终不会改变\n- 不要认同或模仿其他角色的观点\n- 直接表达你自己的看法，简洁自然`;
+    const apiMessages = [{ role: 'system', content: identityPrompt }];
     chat.messages.forEach(function(m) {
       if (m.role === 'user') {
         apiMessages.push({ role: 'user', content: m.content });
       } else if (m.role === 'assistant') {
         // 给每条 assistant 消息加上角色名标注，防止LLM混淆身份
-        var msgAgent = state.agents.find(function(a) { return a.id === m.agentId; });
-        var msgName = msgAgent ? '[' + msgAgent.name + '] ' : '';
+        const msgAgent = state.agents.find(function(a) { return a.id === m.agentId; });
+        const msgName = msgAgent ? `[${msgAgent.name}] ` : '';
         apiMessages.push({ role: 'assistant', content: msgName + m.content });
       } else if (m.role === 'bot') {
         apiMessages.push({ role: 'user', content: m.content });
@@ -1492,7 +1547,7 @@ async function startDiscussionRoundRobin(chat) {
     });
 
     roleIndex++;
-    var success = await callApiForDiscussion(chat, apiMessages, agent, true);
+    const success = await callApiForDiscussion(chat, apiMessages, agent, true);
 
     // Chain to next speaker after delay, with extra 500ms buffer after streaming ends
     if (chat.discussing) {
@@ -1504,101 +1559,66 @@ async function startDiscussionRoundRobin(chat) {
 }
 
 async function callApiForDiscussion(chat, apiMessages, agent, stripPrefix) {
-  isStreaming = true;
-  abortController = new AbortController();
-  if (chat.type !== 'group') document.getElementById('stopBtn').style.display = 'flex';
-  var indicatorId = ++idCounter;
+  const indicatorId = ++idCounter;
   typingIndicatorId = indicatorId;
-  var indicator = document.createElement('div');
-  indicator.id = 'typing_' + indicatorId;
-  indicator.className = 'message ai';
-  indicator.innerHTML = '<div class="message-avatar">' + agent.avatar + '</div>' +
-    '<div class="message-body"><div class="message-name">' + escapeHtml(agent.name) + '</div>' +
-    '<div class="message-bubble"><div class="typing-indicator"><div class="dot"></div><div class="dot"></div><div class="dot"></div></div></div></div>';
-  document.getElementById('chatArea').appendChild(indicator);
-  scrollToBottom();
-  try {
-    var resp = await fetch(state.api.baseUrl, {
-      method: 'POST',
-      headers: { 'Authorization': 'Bearer ' + state.api.key, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: state.api.model, messages: apiMessages, stream: true }),
-      signal: abortController.signal
-    });
-    if (!resp.ok) throw new Error('API Error: ' + resp.status);
-    var reader = resp.body.getReader();
-    var decoder = new TextDecoder();
-    var buffer = '';
-    var fullContent = '';
-    var aiMsg = { role: 'assistant', content: '', timestamp: Date.now(), agentId: agent.id };
-    while (true) {
-      if (typingIndicatorId !== indicatorId) break;
-      var result = await reader.read();
-      if (result.done) break;
-      buffer += decoder.decode(result.value, { stream: true });
-      var lines = buffer.split('\n');
-      buffer = lines.pop();
-      for (var i = 0; i < lines.length; i++) {
-        var trimmed = lines[i].trim();
-        if (!trimmed || !trimmed.startsWith('data: ')) continue;
-        var data = trimmed.slice(6);
-        if (data === '[DONE]') break;
-        try {
-          var parsed = JSON.parse(data);
-          var delta = parsed.choices?.[0]?.delta?.content;
-          if (delta) {
-            fullContent += delta;
-            aiMsg.content = fullContent;
-            var displayContent = (stripPrefix && fullContent.match(/^\[[^\]]+\]\s*/)) ? fullContent.replace(/^\[[^\]]+\]\s*/, '') : fullContent;
-            var bubble = indicator.querySelector('.message-bubble');
-            if (bubble) bubble.innerHTML = renderMarkdown(displayContent) + '<div class="typing-indicator"><div class="dot"></div><div class="dot"></div><div class="dot"></div></div>';
-            scrollToBottom();
-          }
-        } catch(e) {}
+
+  const result = await streamSse({
+    url: state.api.baseUrl,
+    headers: { 'Authorization': 'Bearer ' + state.api.key, 'Content-Type': 'application/json' },
+    body: { model: state.api.model, messages: apiMessages, stream: true },
+    indicatorId: indicatorId,
+    stopBtnDisplay: chat.type !== 'group',
+    avatar: agent.avatar,
+    roleName: escapeHtml(agent.name),
+    onFrame: function(delta, fullContent, indicator) {
+      let displayContent = fullContent;
+      if (stripPrefix) {
+        displayContent = fullContent.replace(/^\[[^\]]+\]\s*/, '');
       }
-    }
-    if (indicator.parentNode) indicator.remove();
-    // Strip [角色名] prefix before storing/displaying
-    var finalContent = fullContent;
-    if (stripPrefix) {
-      finalContent = fullContent.replace(/^\[[^\]]+\]\s*/, '');
-    }
-    aiMsg.content = finalContent;
-    chat.messages.push(aiMsg);
-    renderMessages();
-    return true;
-  } catch(e) {
-    if (indicator.parentNode) indicator.remove();
-    console.error('Discussion error:', e);
-    return false;
-  } finally {
-    isStreaming = false;
-    abortController = null;
-    typingIndicatorId = null;
-    document.getElementById('stopBtn').style.display = 'none';
-  }
+      const bubble = indicator.querySelector('.message-bubble');
+      if (bubble) bubble.innerHTML = renderMarkdown(displayContent) + `<div class="typing-indicator"><div class="dot"></div><div class="dot"></div><div class="dot"></div></div>`;
+      scrollToBottom();
+    },
+    onDone: function(fullContent) {
+      let finalContent = fullContent;
+      if (stripPrefix) {
+        finalContent = fullContent.replace(/^\[[^\]]+\]\s*/, '');
+      }
+      const aiMsg = { role: 'assistant', content: finalContent, timestamp: Date.now(), agentId: agent.id };
+      chat.messages.push(aiMsg);
+      renderMessages();
+    },
+    onError: function(err) {
+      if (err !== 'abort') {
+        console.error('Discussion error:', err);
+      }
+    },
+  });
+
+  return result.ok;
 }
 
 // ===== Auto Reply (Bot Agent acts as a user, thinks via API, then replies) =====
 function startAutoReply(chat) {
   if (autoReplyTimer) { clearInterval(autoReplyTimer); autoReplyTimer = null; }
   autoReplyTimer = setInterval(function() {
-    var currentChat = getActiveChat();
+    const currentChat = getActiveChat();
     if (!currentChat || !currentChat.autoReply || isStreaming) return;
 
-    var botAgent = getBotAgent();
+    const botAgent = getBotAgent();
     if (!botAgent) return;
 
     // Find last AI message to "react" to
-    var lastAiMsg = null;
-    for (var i = currentChat.messages.length - 1; i >= 0; i--) {
+    let lastAiMsg = null;
+    for (let i = currentChat.messages.length - 1; i >= 0; i--) {
       if (currentChat.messages[i].role === 'assistant') {
         lastAiMsg = currentChat.messages[i];
         break;
       }
     }
     // Also react to user messages
-    var lastUserMsg = null;
-    for (var j = currentChat.messages.length - 1; j >= 0; j--) {
+    let lastUserMsg = null;
+    for (let j = currentChat.messages.length - 1; j >= 0; j--) {
       if (currentChat.messages[j].role === 'user' || currentChat.messages[j].role === 'bot') {
         lastUserMsg = currentChat.messages[j];
         break;
@@ -1607,34 +1627,35 @@ function startAutoReply(chat) {
     if (!lastAiMsg && !lastUserMsg) return;
 
     // Build context for bot to think: conversation history + last AI message
-    var ctxMessages = [];
-    // Bot's own identity — strong, unambiguous
-    ctxMessages.push({ role: 'system', content: botAgent.prompt + ' 重要：你是代替用户发言的人，不是 AI 助手。你对 AI 说的话发表简短看法或回应，像普通人在聊天。不要模仿 AI 的语气，不要长篇大论。' });
+    const ctxMessages = [];
+    // Bot's own identity — strong, unambiguous, anti-AI-persona
+    const baseBotInstruction = `${botAgent.prompt} 重要：你是代替用户发言的人，不是 AI 助手。你对 AI 说的话发表简短看法或回应，像普通人在聊天。不要模仿 AI 的语气，不要长篇大论。绝对不要扮演对话中的任何角色，不要说对方的话，只说你自己作为旁观者的回复。`;
     // Brief context — only the AI agent's name, NO prompt
     if (currentChat.type === 'single' && currentChat.agentIds.length) {
-      var aiAgent = state.agents.find(function(a) { return a.id === currentChat.agentIds[0]; });
+      const aiAgent = state.agents.find(function(a) { return a.id === currentChat.agentIds[0]; });
       if (aiAgent) {
-        ctxMessages.push({ role: 'system', content: '你在和 AI "' + aiAgent.name + '" 聊天。阅读对话历史，针对对方最近的一句话发表简短看法（一两句话即可）。' });
+        ctxMessages.push({ role: 'system', content: baseBotInstruction + `\n\n你在和 AI "${aiAgent.name}" 聊天。阅读对话历史，针对对方最近的一句话发表简短看法（一两句话即可）。` });
       }
+    } else {
+      ctxMessages.push({ role: 'system', content: baseBotInstruction });
     }
-    // Include conversation history
+    // Include conversation history with clear role annotations for the Bot
     currentChat.messages.forEach(function(m) {
-      if (m.role === 'user') ctxMessages.push({ role: 'user', content: m.content });
-      else if (m.role === 'assistant') ctxMessages.push({ role: 'assistant', content: m.content });
-      else if (m.role === 'bot') ctxMessages.push({ role: 'user', content: m.content });
+      if (m.role === 'user') ctxMessages.push({ role: 'user', content: '[用户] ' + m.content });
+      else if (m.role === 'assistant') ctxMessages.push({ role: 'user', content: '[' + (function(){const a=state.agents.find(function(x){return x.id===m.agentId;});return a?a.name:'AI'}()) + '] ' + m.content });
+      else if (m.role === 'bot') ctxMessages.push({ role: 'user', content: '[自动回复 Bot] ' + m.content });
     });
 
-    // Step 1: Bot "thinks" — API call
-    isStreaming = true;
-    var botIndicatorId = ++idCounter;
+    // Step 1: Bot "thinks" — API call (no isStreaming manipulation here; callApi handles it)
+    const botIndicatorId = ++idCounter;
     typingIndicatorId = botIndicatorId;
-    var indicator = document.createElement('div');
+    const indicator = document.createElement('div');
     indicator.id = 'typing_bot_' + botIndicatorId;
     indicator.className = 'message bot';
-    indicator.innerHTML = '<div class="message-avatar">' + (botAgent.avatar || '🤖') + '</div>' +
-      '<div class="message-body"><div class="message-name">' + escapeHtml(botAgent.name) + '</div>' +
-      '<div class="message-bubble"><div class="typing-indicator"><div class="dot"></div><div class="dot"></div><div class="dot"></div></div></div></div>';
-    var area = document.getElementById('chatArea');
+    indicator.innerHTML = `<div class="message-avatar">${botAgent.avatar || '🤖'}</div>` +
+      `<div class="message-body"><div class="message-name">${escapeHtml(botAgent.name)}</div>` +
+      `<div class="message-bubble"><div class="typing-indicator"><div class="dot"></div><div class="dot"></div><div class="dot"></div></div></div></div>`;
+    const area = document.getElementById('chatArea');
     area.appendChild(indicator);
     scrollToBottom();
 
@@ -1642,69 +1663,69 @@ function startAutoReply(chat) {
       method: 'POST',
       headers: { 'Authorization': 'Bearer ' + state.api.key, 'Content-Type': 'application/json' },
       body: JSON.stringify({ model: state.api.model, messages: ctxMessages, max_tokens: 300 })
-    }).then(function(resp) {
-      if (!resp.ok) { console.error('Auto-reply API error:', resp.status); return null; }
-      return resp.json();
-    })
-      .then(function(data) {
-        if (!data) return;
-        var botText = data.choices?.[0]?.message?.content || '';
-        if (!botText) {
-          console.warn('Auto-reply: empty response, stopping timer');
-          if (autoReplyTimer) { clearInterval(autoReplyTimer); autoReplyTimer = null; }
-          currentChat.autoReply = false;
-          return;
-        }
+    }).then(async function(resp) {
+      if (!resp.ok) { console.error('Auto-reply API error:', resp.status); indicator.remove(); return null; }
+      const data = await resp.json();
+      if (!data) { indicator.remove(); return null; }
+      const botText = data.choices?.[0]?.message?.content || '';
+      if (!botText) {
+        console.warn('Auto-reply: empty response, stopping timer');
+        if (autoReplyTimer) { clearInterval(autoReplyTimer); autoReplyTimer = null; }
+        currentChat.autoReply = false;
+        indicator.remove();
+        return;
+      }
 
-        // Step 2: Add bot's message as a 'bot' role message
-        var botMsg = { role: 'bot', content: botText, timestamp: Date.now() };
-        currentChat.messages.push(botMsg);
+      // Remove bot typing indicator immediately after getting response
+      indicator.remove();
 
-        // Render the bot's message
-        var botDiv = document.createElement('div');
-        botDiv.className = 'message bot';
-        botDiv.innerHTML = '<div class="message-avatar">' + (botAgent.avatar || '🤖') + '</div>' +
-          '<div class="message-body">' +
-            '<div class="message-name">' + escapeHtml(botAgent.name) + '</div>' +
-            '<div class="message-bubble">' + renderMarkdown(botText) + '</div>' +
-            '<div class="message-time">' + formatTime(botMsg.timestamp) + '</div>' +
-          '</div>';
-        area.appendChild(botDiv);
-        scrollToBottom();
+      const botMsg = { role: 'bot', content: botText, timestamp: Date.now() };
+      currentChat.messages.push(botMsg);
 
-        // Step 3: Trigger normal AI reply to the bot's message
-        var replyMessages = buildApiMessages(currentChat);
-        callApi(currentChat, replyMessages);
-      })
-      .catch(function(err) { console.error('Auto-reply error:', err); })
-      .finally(function() {
-        if (indicator.parentNode) indicator.remove();
-        // isStreaming 会在 callApi 的 finally 里清除
-      });
+      const botDiv = document.createElement('div');
+      botDiv.className = 'message bot';
+      botDiv.innerHTML = `<div class="message-avatar">${botAgent.avatar || '🤖'}</div>` +
+        `<div class="message-body">` +
+          `<div class="message-name">${escapeHtml(botAgent.name)}</div>` +
+          `<div class="message-bubble">${renderMarkdown(botText)}</div>` +
+          `<div class="message-time">${formatTime(botMsg.timestamp)}</div>` +
+        `</div>`;
+      area.appendChild(botDiv);
+      scrollToBottom();
+
+      // Step 3: Trigger normal AI reply — await to prevent isStreaming race
+      const replyMessages = buildApiMessages(currentChat);
+      await callApi(currentChat, replyMessages);
+      // indicator already removed above after bot got response text
+    }).catch(function(err) {
+      console.error('Auto-reply error:', err);
+      indicator.remove();
+    });
   }, autoReplyDelay);
 }
-
-// ===== Config Export/Import =====
 function renderConfig() {
-  var el = document.getElementById('configContent');
+  const el = document.getElementById('configContent');
   if (!el) return;
+
+  // Rebuilding innerHTML destroys old button elements and their listeners.
+  // New buttons get fresh listeners — no accumulation possible.
   el.innerHTML =
-    '<div class="api-config-card">' +
-      '<div style="font-size:14px;font-weight:600;margin-bottom:12px;">&#9881; 配置管理</div>' +
-      '<p style="font-size:12px;color:var(--text-muted);margin-bottom:12px;">导出/导入 API 配置、Agent 信息和聊天记录。</p>' +
-      '<div style="display:flex;gap:8px;flex-wrap:wrap;">' +
-        '<button class="btn btn-primary btn-sm" id="exportCfgBtn">&#128229; 导出配置</button>' +
-        '<button class="btn btn-ghost btn-sm" id="importCfgBtn">&#128190; 导入配置</button>' +
-        '<button class="btn btn-primary btn-sm" id="exportBackupBtn">&#128196; 导出配置和聊天记录</button>' +
-        '<button class="btn btn-ghost btn-sm" id="importBackupBtn">&#128190; 导入配置和聊天记录</button>' +
-      '</div>' +
-      '<input type="file" id="importFile" accept=".json" style="display:none;">' +
-      '<input type="file" id="importBackupFile" accept=".json" style="display:none;">' +
-    '</div>';
+    `<div class="api-config-card">
+      <div style="font-size:14px;font-weight:600;margin-bottom:12px;">&#9881; 配置管理</div>
+      <p style="font-size:12px;color:var(--text-muted);margin-bottom:12px;">导出/导入 API 配置、Agent 信息和聊天记录。</p>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;">
+        <button class="btn btn-primary btn-sm" id="exportCfgBtn">&#128229; 导出配置</button>
+        <button class="btn btn-ghost btn-sm" id="importCfgBtn">&#128190; 导入配置</button>
+        <button class="btn btn-primary btn-sm" id="exportBackupBtn">&#128196; 导出配置和聊天记录</button>
+        <button class="btn btn-ghost btn-sm" id="importBackupBtn">&#128190; 导入配置和聊天记录</button>
+      </div>
+      <input type="file" id="importFile" accept=".json" style="display:none;">
+      <input type="file" id="importBackupFile" accept=".json" style="display:none;">
+    </div>`;
 
   // Export
   document.getElementById('exportCfgBtn').addEventListener('click', function() {
-    var config = {
+    const config = {
       version: '1.0',
       exportedAt: new Date().toISOString(),
       api: {
@@ -1717,11 +1738,11 @@ function renderConfig() {
         return { name: a.name, prompt: a.prompt, avatar: a.avatar, type: a.type };
       })
     };
-    var blob = new Blob([JSON.stringify(config, null, 2)], { type: 'application/json' });
-    var url = URL.createObjectURL(blob);
-    var a = document.createElement('a');
+    const blob = new Blob([JSON.stringify(config, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
     a.href = url;
-    a.download = 'oriontalk_config_' + new Date().toISOString().slice(0,10) + '.json';
+    a.download = `oriontalk_config_${new Date().toISOString().slice(0,10)}.json`;
     a.click();
     URL.revokeObjectURL(url);
   });
@@ -1731,12 +1752,12 @@ function renderConfig() {
     document.getElementById('importFile').click();
   });
   document.getElementById('importFile').addEventListener('change', function(e) {
-    var file = e.target.files[0];
+    const file = e.target.files[0];
     if (!file) return;
-    var reader = new FileReader();
+    const reader = new FileReader();
     reader.onload = function(ev) {
       try {
-        var config = JSON.parse(ev.target.result);
+        const config = JSON.parse(ev.target.result);
         if (!config.api || !config.agents) { alert('配置文件格式错误'); return; }
         // Restore API
         state.api.name = config.api.name || state.api.name;
@@ -1749,7 +1770,7 @@ function renderConfig() {
         });
         // Always ensure one Bot Agent
         if (!getBotAgent()) {
-          var bot = config.agents.find(function(a) { return a.type === 'bot'; });
+          const bot = config.agents.find(function(a) { return a.type === 'bot'; });
           if (bot) setBotAgent({ name: bot.name, prompt: bot.prompt, avatar: bot.avatar || '🤖', type: 'bot' });
         }
         renderAll();
@@ -1765,7 +1786,7 @@ function renderConfig() {
 
   // Export backup (config + chat history)
   document.getElementById('exportBackupBtn').addEventListener('click', function() {
-    var backup = {
+    const backup = {
       version: '1.1',
       exportedAt: new Date().toISOString(),
       type: 'full-backup',
@@ -1790,11 +1811,11 @@ function renderConfig() {
         };
       })
     };
-    var blob = new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' });
-    var url = URL.createObjectURL(blob);
-    var a = document.createElement('a');
+    const blob = new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
     a.href = url;
-    a.download = 'oriontalk_backup_' + new Date().toISOString().slice(0,10) + '.json';
+    a.download = `oriontalk_backup_${new Date().toISOString().slice(0,10)}.json`;
     a.click();
     URL.revokeObjectURL(url);
   });
@@ -1804,12 +1825,12 @@ function renderConfig() {
     document.getElementById('importBackupFile').click();
   });
   document.getElementById('importBackupFile').addEventListener('change', function(e) {
-    var file = e.target.files[0];
+    const file = e.target.files[0];
     if (!file) return;
-    var reader = new FileReader();
+    const reader = new FileReader();
     reader.onload = function(ev) {
       try {
-        var data = JSON.parse(ev.target.result);
+        const data = JSON.parse(ev.target.result);
         if (!data.api || !data.agents) { alert('文件格式错误：缺少 api 或 agents 字段'); return; }
         // Restore API
         state.api.name = data.api.name || state.api.name;
@@ -1822,7 +1843,7 @@ function renderConfig() {
         });
         // Always ensure one Bot Agent
         if (!getBotAgent()) {
-          var bot = data.agents.find(function(a) { return a.type === 'bot'; });
+          const bot = data.agents.find(function(a) { return a.type === 'bot'; });
           if (bot) setBotAgent({ name: bot.name, prompt: bot.prompt, avatar: bot.avatar || '🤖', type: 'bot' });
         }
         // Restore chats if present
@@ -1854,8 +1875,8 @@ function renderConfig() {
 
 // ===== Send =====
 document.getElementById('sendBtn').addEventListener('click', function() {
-  var input = document.getElementById('msgInput');
-  var content = input.value.trim();
+  const input = document.getElementById('msgInput');
+  const content = input.value.trim();
   if (!content || isStreaming) return;
   input.value = '';
   input.style.height = 'auto';
@@ -1866,7 +1887,7 @@ document.getElementById('msgInput').addEventListener('keydown', function(e) {
 });
 document.getElementById('msgInput').addEventListener('input', function() {
   this.style.height = 'auto';
-  this.style.height = Math.min(this.scrollHeight, 120) + 'px';
+  this.style.height = `${Math.min(this.scrollHeight, 120)}px`;
 });
 
 // ===== Init =====
