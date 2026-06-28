@@ -608,6 +608,7 @@ body.dragging * { cursor: col-resize !important; }
       <textarea id="msgInput" placeholder="输入消息... (Enter 发送, Shift+Enter 换行)" rows="1"></textarea>
       <button class="control-btn" id="autoReplyInputBtn" style="display:none;" title="自动回复：Agent代替你发言">&#9881; 自动回复</button>
       <button class="control-btn" id="discussInputBtn" style="display:none;" title="自由讨论：AI们互相讨论">&#128269; 自由讨论</button>
+      <button class="control-btn" id="turnSettingsBtn" style="display:none;" title="自动回复/自由讨论设置">&#9881;&#65039; 设置</button>
       <button class="btn btn-primary" id="sendBtn">&#10148;</button>
     </div>
   </div>
@@ -912,11 +913,19 @@ function renderChatHeader() {
   document.getElementById('mainHeader').style.display = 'flex';
   document.getElementById('inputArea').style.display = 'flex';
   document.getElementById('chatTitle').textContent = chat.title;
+  // Settings button always visible when a chat is active
+  const tsBtn = document.getElementById('turnSettingsBtn');
+  if (tsBtn) tsBtn.style.display = 'flex';
   if (chat.type === 'single') {
     const agent = state.agents.find(function(a) { return a.id === chat.agentIds[0]; });
     document.getElementById('chatSubtitle').textContent = agent ? agent.name : '';
     const arBtn = document.getElementById('autoReplyInputBtn');
-    if (arBtn) { arBtn.style.display = 'flex'; arBtn.classList.toggle('on', !!chat.autoReply); arBtn.innerHTML = (!!chat.autoReply ? '&#10003; ' : '&#9881; ') + '自动回复'; }
+    if (arBtn) {
+      arBtn.style.display = 'flex';
+      arBtn.classList.toggle('on', !!chat.autoReply);
+      const remaining = chat.maxTurns - (chat.turnCount || 0);
+      arBtn.innerHTML = (!!chat.autoReply ? '&#10003; ' : '&#9881; ') + '自动回复 (' + remaining + '/' + chat.maxTurns + ')';
+    }
     const dBtn = document.getElementById('discussInputBtn');
     if (dBtn) dBtn.style.display = 'none';
   } else {
@@ -929,7 +938,12 @@ function renderChatHeader() {
     const arBtn = document.getElementById('autoReplyInputBtn');
     if (arBtn) arBtn.style.display = 'none';
     const dBtn = document.getElementById('discussInputBtn');
-    if (dBtn) { dBtn.style.display = 'flex'; dBtn.classList.toggle('on', !!chat.discussing); dBtn.innerHTML = (!!chat.discussing ? '&#10003; ' : '&#128269; ') + '自由讨论'; }
+    if (dBtn) {
+      dBtn.style.display = 'flex';
+      dBtn.classList.toggle('on', !!chat.discussing);
+      const remaining = chat.maxTurns - (chat.turnCount || 0);
+      dBtn.innerHTML = (!!chat.discussing ? '&#10003; ' : '&#128269; ') + '自由讨论 (' + remaining + '/' + chat.maxTurns + ')';
+    }
   }
 }
 
@@ -1005,6 +1019,12 @@ function switchChat(chatId) {
   if (isStreaming) stopStreaming();
   if (autoReplyTimer) { clearInterval(autoReplyTimer); autoReplyTimer = null; }
   if (discussTimeout) { clearTimeout(discussTimeout); discussTimeout = null; }
+  // Stop autoReply/discussing on the previous chat
+  const prevChat = state.chats.find(function(c) { return c.id === state.activeChatId; });
+  if (prevChat) {
+    prevChat.autoReply = false;
+    prevChat.discussing = false;
+  }
   state.activeChatId = chatId;
   renderAll();
 }
@@ -1018,6 +1038,8 @@ function createChat(type, agentIds) {
     agentIds: agentIds || (type === 'single' ? [state.agents[0]?.id] : []),
     autoReply: false,
     discussing: false,
+    maxTurns: 10,
+    turnCount: 0,
   };
   state.chats.unshift(chat);
   state.activeChatId = chat.id;
@@ -1303,6 +1325,14 @@ document.addEventListener('click', function(e) {
     }
     return;
   }
+
+  // --- Turn settings ---
+  const tsBtn = e.target.closest('#turnSettingsBtn');
+  if (tsBtn) {
+    const chat = getActiveChat();
+    if (chat) showTurnSettingsModal(chat);
+    return;
+  }
 });
 
 // Sidebar tabs
@@ -1397,6 +1427,8 @@ async function sendMessage(content) {
     chat.discussing = false;
     if (discussTimeout) { clearTimeout(discussTimeout); discussTimeout = null; }
   }
+  // Reset turn count when user sends a message
+  chat.turnCount = 0;
   if (isStreaming) return;
   const msg = { role: 'user', content: content, timestamp: Date.now() };
   chat.messages.push(msg);
@@ -1497,6 +1529,10 @@ async function startDiscussionRoundRobin(chat) {
   const roleIds = chat.agentIds;
   const totalRoles = roleIds.length;
 
+  // Track turns: one full round = every agent speaks once
+  let speakersThisRound = 0;
+  let turnsCompleted = chat.turnCount || 0;
+
   // Infer roleIndex from conversation history — don't start from 0
   let roleIndex = 0;
   let lastAssistantIdx = -1;
@@ -1512,10 +1548,19 @@ async function startDiscussionRoundRobin(chat) {
   }
   if (lastAssistantIdx >= 0) {
     roleIndex = (lastAssistantIdx + 1) % totalRoles;
+    speakersThisRound = 1; // one agent already spoke this round
   }
 
   async function speakNext() {
     if (!chat.discussing) return;
+    // Check max turns at the start of each cycle
+    if (turnsCompleted >= chat.maxTurns) {
+      console.log('[FreeDiscussion] Max turns reached, stopping.');
+      chat.discussing = false;
+      if (discussTimeout) { clearTimeout(discussTimeout); discussTimeout = null; }
+      renderChatHeader();
+      return;
+    }
     if (isStreaming) {
       discussTimeout = setTimeout(speakNext, 500);
       return;
@@ -1547,7 +1592,16 @@ async function startDiscussionRoundRobin(chat) {
     });
 
     roleIndex++;
+    speakersThisRound++;
     const success = await callApiForDiscussion(chat, apiMessages, agent, true);
+
+    // Check if one full round completed
+    if (speakersThisRound >= totalRoles) {
+      chat.turnCount++;
+      speakersThisRound = 0;
+      // Refresh button UI to show updated remaining turns
+      renderChatHeader();
+    }
 
     // Chain to next speaker after delay, with extra 500ms buffer after streaming ends
     if (chat.discussing) {
@@ -1599,11 +1653,22 @@ async function callApiForDiscussion(chat, apiMessages, agent, stripPrefix) {
 }
 
 // ===== Auto Reply (Bot Agent acts as a user, thinks via API, then replies) =====
+let autoReplyBusy = false; // prevents overlapping Bot→AI cycles
 function startAutoReply(chat) {
   if (autoReplyTimer) { clearInterval(autoReplyTimer); autoReplyTimer = null; }
   autoReplyTimer = setInterval(function() {
     const currentChat = getActiveChat();
-    if (!currentChat || !currentChat.autoReply || isStreaming) return;
+    if (!currentChat || !currentChat.autoReply) return;
+    if (isStreaming || autoReplyBusy) return;
+    // 轮次检查
+    if (currentChat.turnCount >= currentChat.maxTurns) {
+      console.log('[AutoReply] Max turns reached, stopping.');
+      currentChat.autoReply = false;
+      clearInterval(autoReplyTimer);
+      autoReplyTimer = null;
+      renderChatHeader();
+      return;
+    }
 
     const botAgent = getBotAgent();
     if (!botAgent) return;
@@ -1647,6 +1712,7 @@ function startAutoReply(chat) {
     });
 
     // Step 1: Bot "thinks" — API call (no isStreaming manipulation here; callApi handles it)
+    autoReplyBusy = true; // lock: prevent setInterval from starting another cycle while fetch+reply is pending
     const botIndicatorId = ++idCounter;
     typingIndicatorId = botIndicatorId;
     const indicator = document.createElement('div');
@@ -1670,6 +1736,7 @@ function startAutoReply(chat) {
       const botText = data.choices?.[0]?.message?.content || '';
       if (!botText) {
         console.warn('Auto-reply: empty response, stopping timer');
+        autoReplyBusy = false;
         if (autoReplyTimer) { clearInterval(autoReplyTimer); autoReplyTimer = null; }
         currentChat.autoReply = false;
         indicator.remove();
@@ -1696,13 +1763,53 @@ function startAutoReply(chat) {
       // Step 3: Trigger normal AI reply — await to prevent isStreaming race
       const replyMessages = buildApiMessages(currentChat);
       await callApi(currentChat, replyMessages);
+      // Increment turn count after one complete Bot→AI cycle
+      currentChat.turnCount++;
+      // Release lock so next cycle can start
+      autoReplyBusy = false;
+      // Refresh button UI to show updated remaining turns
+      renderChatHeader();
       // indicator already removed above after bot got response text
     }).catch(function(err) {
       console.error('Auto-reply error:', err);
+      autoReplyBusy = false;
       indicator.remove();
     });
   }, autoReplyDelay);
 }
+
+// ===== Turn Settings Modal =====
+function showTurnSettingsModal(chat) {
+  const currentRemaining = chat.maxTurns - (chat.turnCount || 0);
+  const typeLabel = chat.type === 'single' ? '自动回复' : '自由讨论';
+  showModal('<h3>设置 ' + typeLabel + ' 轮次 <span class="modal-close" onclick="hideModal()">&times;</span></h3>' +
+    '<div style="font-size:13px;color:var(--text-muted);margin-bottom:14px;">当前: ' + currentRemaining + '/' + chat.maxTurns + ' 剩余</div>' +
+    '<div class="form-group"><label>最大轮次 (<span id="turnSettingValue">' + chat.maxTurns + '</span>)</label>' +
+      '<input type="range" id="turnSettingRange" min="1" max="100" value="' + chat.maxTurns + '" style="width:100%;">' +
+    '</div>' +
+    '<div class="modal-actions">' +
+      '<button class="btn btn-ghost close-modal-btn" onclick="hideModal()">取消</button>' +
+      '<button class="btn btn-primary reset-turns-btn">重置轮次</button>' +
+    '</div>');
+
+  // Sync range input display
+  var rangeInput = document.getElementById('turnSettingRange');
+  var display = document.getElementById('turnSettingValue');
+  rangeInput.addEventListener('input', function() {
+    display.textContent = rangeInput.value;
+  });
+
+  document.querySelector('.reset-turns-btn').addEventListener('click', function() {
+    var newVal = parseInt(rangeInput.value, 10);
+    if (newVal >= 1 && newVal <= 100) {
+      chat.maxTurns = newVal;
+      chat.turnCount = 0;
+      renderChatHeader();
+    }
+    hideModal();
+  });
+}
+
 function renderConfig() {
   const el = document.getElementById('configContent');
   if (!el) return;
@@ -1856,6 +1963,8 @@ function renderConfig() {
               agentIds: c.agentIds || [],
               autoReply: !!c.autoReply,
               discussing: !!c.discussing,
+              maxTurns: c.maxTurns != null ? c.maxTurns : 10,
+              turnCount: c.turnCount || 0,
               messages: c.messages || []
             };
           });
